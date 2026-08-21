@@ -1,0 +1,13 @@
+{
+  "name": "gb-link-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "同一 WiFi 區網用的 Game Boy 模擬器連線對戰中繼伺服器",
+  "main": "link-server.js",
+  "scripts": {
+    "start": "node link-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

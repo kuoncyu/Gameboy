@@ -2676,28 +2676,35 @@ class Emulator{
     let audioWatchdogCounter = 0;
     let sramAutosaveCounter = 0;
     const loop = ()=>{
-      const linkBlocking = !!(window.linkCable && window.linkCable.isBlocking());
-      if(this.running && !this.paused && !linkBlocking){
-        const n = this.speedMultiplier || 1;
-        for(let i=0;i<n;i++){
-          this.updateTurbo();
-          this.runFrame();
+      try{
+        const linkBlocking = !!(window.linkCable && window.linkCable.isBlocking());
+        if(this.running && !this.paused && !linkBlocking){
+          const n = this.speedMultiplier || 1;
+          for(let i=0;i<n;i++){
+            this.updateTurbo();
+            this.runFrame();
+          }
+          if(this.ppu) this.ppu.present();
         }
-        if(this.ppu) this.ppu.present();
-      }
-      // 每隔約2秒檢查一次：iOS 上 AudioContext 有時會被系統自動 suspend（例如短暫鎖螢幕），
-      // 已經解鎖過一次之後，之後的 resume() 不需要新的使用者手勢也能生效
-      audioWatchdogCounter++;
-      if(audioWatchdogCounter >= 120){
-        audioWatchdogCounter = 0;
-        if(this.audioCtx && this.audioCtx.state === "suspended") this.audioCtx.resume().catch(()=>{});
-      }
-      // 遊戲內建（電池）存檔：若有新寫入，每隔約1秒同步一次進 localStorage，
-      // 避免每個位元組寫入都存一次拖慢效能，但也不會拖太久才落地
-      sramAutosaveCounter++;
-      if(sramAutosaveCounter >= 60){
-        sramAutosaveCounter = 0;
-        if(this.cart && this.cart.sramDirty) saveBatteryRam(this.cart);
+        // 每隔約2秒檢查一次：iOS 上 AudioContext 有時會被系統自動 suspend（例如短暫鎖螢幕），
+        // 已經解鎖過一次之後，之後的 resume() 不需要新的使用者手勢也能生效
+        audioWatchdogCounter++;
+        if(audioWatchdogCounter >= 120){
+          audioWatchdogCounter = 0;
+          if(this.audioCtx && this.audioCtx.state === "suspended") this.audioCtx.resume().catch(()=>{});
+        }
+        // 遊戲內建（電池）存檔：若有新寫入，每隔約1秒同步一次進 localStorage，
+        // 避免每個位元組寫入都存一次拖慢效能，但也不會拖太久才落地
+        sramAutosaveCounter++;
+        if(sramAutosaveCounter >= 60){
+          sramAutosaveCounter = 0;
+          if(this.cart && this.cart.sramDirty) saveBatteryRam(this.cart);
+        }
+      }catch(err){
+        // 任何一幀執行中丟出例外都不能讓整個迴圈死掉，否則畫面會永久凍結、按什麼都沒反應。
+        // 這裡把錯誤記錄下來（連線除錯面板也看得到），並略過這一幀，讓下一幀繼續嘗試執行。
+        console.error("模擬迴圈發生例外，已略過這一幀並繼續：", err);
+        if(window.linkCable) window.linkCable._logEvent("sys", "frame-error:" + (err && err.message || String(err)), null);
       }
       this.rafId = requestAnimationFrame(loop);
     };

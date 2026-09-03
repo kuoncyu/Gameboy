@@ -1386,12 +1386,16 @@ class LinkCable{
     if(!bus) return; // 模擬器尚未載入 ROM，留在佇列裡，loadRom 完成後會呼叫 _pumpQueue() 補送
     const item = this._incomingQueue.shift();
     this._deliverBusy = true;
+    // 一定要在覆寫 SB 之前，先記錄本機「原本準備送出」的資料，
+    // 否則下面 _completeTransfer 會把 bus.io[0x01] 蓋成剛收到的資料，
+    // 回送出去的 resp 就變成把對方的資料原封不動彈回去，而不是本機真正的回應。
+    const myByte = bus.io[0x01];
     this._completeTransfer(bus, item.byte);
     // 依照真實硬體「同一次傳輸雙向同時交換」的行為：若這筆是對方主動發起的傳輸
-    // （kind !== "resp"），立刻回送本機目前 SB 的內容，讓發起端也能完成自己的傳輸；
+    // （kind !== "resp"），立刻回送本機（覆寫前）的 SB 內容，讓發起端也能完成自己的傳輸；
     // 若本身已經是回覆（kind === "resp"）就不再繼續回送，避免無限乒乓。
     if(item.kind !== "resp"){
-      this._sendByte(bus.io[0x01], "resp");
+      this._sendByte(myByte, "resp");
     }
   }
   _completeTransfer(bus, byte){

@@ -1162,6 +1162,8 @@ class LinkCable{
     this.onStatusChange = null;    // (kind, message) => void
     this._incomingQueue = [];      // 收到但尚未套用進遊戲的資料佇列（避免被下一筆覆蓋掉）
     this._deliverBusy = false;     // 上一筆收到的資料是否還在等本機遊戲處理（尚未重新寫入 SC）
+    this._awaitingReply = false;   // 本機是否剛送出 req、正在等對方的 resp（等待期間會暫停模擬時間）
+    this._awaitingReplySince = 0;  // 開始等待的時間戳，超過安全時限就放棄暫停，避免整個模擬器卡死
     this._heartbeatTimer = null;   // 送出自己心跳的計時器
     this._monitorTimer = null;     // 檢查對方心跳是否過期的計時器
     this._peerHeartbeatAt = 0;     // 本機最後一次收到對方心跳的時間
@@ -1396,7 +1398,23 @@ class LinkCable{
     // 若本身已經是回覆（kind === "resp"）就不再繼續回送，避免無限乒乓。
     if(item.kind !== "resp"){
       this._sendByte(myByte, "resp");
+    } else {
+      // 收到的是對方回送的 resp：代表本機先前那筆 req 已經有結果了，
+      // 可以讓暫停的模擬時間繼續往前跑。
+      this._awaitingReply = false;
     }
+  }
+  // 是否應該讓模擬器暫停「不跑」：本機剛送出 req、正在等對方的 resp 期間，
+  // 讓 CPU/PPU/Timer 停止前進，避免真實世界的網路延遲被算進遊戲內部的逾時計時器，
+  // 造成遊戲誤判「太久沒收到連線資料」而顯示 Too much time has elapsed。
+  // 有安全時限，超過就放棄暫停（避免對方真的斷線時整個模擬器卡死）。
+  isBlocking(){
+    if(!this._awaitingReply) return false;
+    if(Date.now() - this._awaitingReplySince > 3000){
+      this._awaitingReply = false;
+      return false;
+    }
+    return true;
   }
   _completeTransfer(bus, byte){
     bus.io[0x01] = byte & 0xFF;
@@ -1415,6 +1433,9 @@ class LinkCable{
       this._deliverBusy = false;
       // 標記為 "req"，對方收到後會自動回送目前的 SB，模擬雙向同時交換，讓本機的傳輸也能完成。
       this._sendByte(bus.io[0x01], "req");
+      // 開始暫停模擬時間，直到對方的 resp 回來為止（見 isBlocking()）
+      this._awaitingReply = true;
+      this._awaitingReplySince = Date.now();
       this._pumpQueue(); // 若佇列裡還有排隊中的資料，這裡立刻補送
     }
   }
@@ -1439,6 +1460,8 @@ class LinkCable{
     this.roomCode = null;
     this._incomingQueue = [];
     this._deliverBusy = false;
+    this._awaitingReply = false;
+    this._awaitingReplySince = 0;
     this._peerOnline = false;
     this._peerHeartbeatAt = 0;
   }
@@ -2519,7 +2542,8 @@ class Emulator{
     let audioWatchdogCounter = 0;
     let sramAutosaveCounter = 0;
     const loop = ()=>{
-      if(this.running && !this.paused){
+      const linkBlocking = !!(window.linkCable && window.linkCable.isBlocking());
+      if(this.running && !this.paused && !linkBlocking){
         const n = this.speedMultiplier || 1;
         for(let i=0;i<n;i++){
           this.updateTurbo();

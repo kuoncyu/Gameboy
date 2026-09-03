@@ -1142,6 +1142,12 @@ const FIREBASE_CONFIG = {
 const LINK_HEARTBEAT_MS = 1000;  // 心跳送出間隔：連線期間持續每秒送出一次，讓斷線能更快被偵測到
 const LINK_STALE_MS = 5000;      // 對方心跳超過這個時間沒更新，視為暫時失聯（但持續嘗試自動恢復）
 const LINK_ROOM_CODE_CHARS = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"; // 避免 0/O、1/I 等易混淆字元
+// WebRTC 直連用的 STUN 伺服器：只負責幫兩端互相探測對外位址，實際遊戲資料建立好之後
+// 是瀏覽器對瀏覽器直接傳送，不會再經過任何伺服器中繼，延遲會比透過 Firebase 轉送低很多。
+const RTC_ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" }
+];
 
 function ensureFirebaseApp(){
   if(typeof firebase === "undefined"){
@@ -1180,6 +1186,9 @@ class LinkCable{
     this._wakeLock = null;
     this._visibilityCb = null;
     this._authReadyPromise = null;
+    this._pc = null;               // RTCPeerConnection（WebRTC 直連用）
+    this._dc = null;               // RTCDataChannel（實際遊戲資料走這裡，低延遲）
+    this._rtcRefs = [];            // WebRTC 信令用的 Firebase 監聽器，斷線時要一併清掉
   }
   _status(kind, msg){
     if(this.onStatusChange) this.onStatusChange(kind, msg);
@@ -1315,6 +1324,90 @@ class LinkCable{
     chRef.on("child_added", this._byteCb);
     this._byteRef = chRef;
   }
+  // 建立 WebRTC 直連：Firebase 只拿來交換信令（SDP + ICE candidate），
+  // 真正連上之後遊戲資料就走瀏覽器對瀏覽器的 RTCDataChannel，延遲比透過 Firebase 轉送低很多。
+  // 如果因為網路環境（例如嚴格的 NAT/防火牆）建立失敗，_sendByte 會自動退回原本的 Firebase 轉送，
+  // 所以連不成 WebRTC 也不影響基本功能，只是速度回到原本的樣子。
+  _setupRTC(){
+    if(typeof RTCPeerConnection === "undefined"){
+      this._logEvent("sys","rtc-unsupported",null); // 瀏覽器不支援，維持用 Firebase 轉送
+      return;
+    }
+    const isHost = this.role === "host";
+    const pc = new RTCPeerConnection({ iceServers: RTC_ICE_SERVERS });
+    this._pc = pc;
+    this._rtcRefs = [];
+    const roomRef = this.db.ref(`rooms/${this.roomCode}/rtc`);
+    const myCandPath = isHost ? "hostCandidates" : "guestCandidates";
+    const peerCandPath = isHost ? "guestCandidates" : "hostCandidates";
+
+    pc.onicecandidate = (e)=>{
+      if(e.candidate){
+        roomRef.child(myCandPath).push(e.candidate.toJSON()).catch(()=>{});
+      }
+    };
+    pc.onconnectionstatechange = ()=>{
+      this._logEvent("sys","rtc-state:"+pc.connectionState,null);
+    };
+
+    const peerCandRef = roomRef.child(peerCandPath);
+    const peerCandCb = (snap)=>{
+      const val = snap.val();
+      if(val) pc.addIceCandidate(val).catch(()=>{});
+    };
+    peerCandRef.on("child_added", peerCandCb);
+    this._rtcRefs.push({ ref: peerCandRef, event: "child_added", cb: peerCandCb });
+
+    if(isHost){
+      const dc = pc.createDataChannel("gbc-serial", { ordered: true });
+      this._wireDataChannel(dc);
+      pc.createOffer()
+        .then(offer=>pc.setLocalDescription(offer))
+        .then(()=>roomRef.child("offer").set({ type: pc.localDescription.type, sdp: pc.localDescription.sdp }))
+        .catch(err=>this._logEvent("sys","rtc-offer-fail:"+(err&&err.message||err),null));
+      const answerRef = roomRef.child("answer");
+      const answerCb = (snap)=>{
+        const val = snap.val();
+        if(val && !pc.currentRemoteDescription){
+          pc.setRemoteDescription(val).catch(err=>this._logEvent("sys","rtc-setremote-fail:"+(err&&err.message||err),null));
+        }
+      };
+      answerRef.on("value", answerCb);
+      this._rtcRefs.push({ ref: answerRef, event: "value", cb: answerCb });
+    } else {
+      pc.ondatachannel = (e)=>{ this._wireDataChannel(e.channel); };
+      const offerRef = roomRef.child("offer");
+      const offerCb = (snap)=>{
+        const val = snap.val();
+        if(val && !pc.currentRemoteDescription){
+          pc.setRemoteDescription(val)
+            .then(()=>pc.createAnswer())
+            .then(answer=>pc.setLocalDescription(answer))
+            .then(()=>roomRef.child("answer").set({ type: pc.localDescription.type, sdp: pc.localDescription.sdp }))
+            .catch(err=>this._logEvent("sys","rtc-answer-fail:"+(err&&err.message||err),null));
+        }
+      };
+      offerRef.on("value", offerCb);
+      this._rtcRefs.push({ ref: offerRef, event: "value", cb: offerCb });
+    }
+  }
+  _wireDataChannel(dc){
+    this._dc = dc;
+    dc.onopen = ()=>{
+      this._logEvent("sys","rtc-open",null);
+    };
+    dc.onclose = ()=>{
+      this._logEvent("sys","rtc-closed",null);
+      if(this._dc === dc) this._dc = null;
+    };
+    dc.onerror = ()=>{ this._logEvent("sys","rtc-error",null); };
+    dc.onmessage = (e)=>{
+      try{
+        const val = JSON.parse(e.data);
+        if(val && typeof val.b === "number") this._receiveByte(val.b & 0xFF, val.k);
+      }catch(err){ /* 忽略解析失敗的訊息 */ }
+    };
+  }
   // 房主：建立房間，回傳房間代碼
   async createRoom(){
     this.disconnect();
@@ -1331,6 +1424,7 @@ class LinkCable{
       });
       roomRef.child("hostOnline").onDisconnect().set(false);
       this._wireByteChannel("toHost");
+      this._setupRTC();
       this._watchPeer("guest");
       this._watchConnectionInfo();
       this._startHeartbeat();
@@ -1364,6 +1458,7 @@ class LinkCable{
       await roomRef.child("guestOnline").set(true);
       roomRef.child("guestOnline").onDisconnect().set(false);
       this._wireByteChannel("toGuest");
+      this._setupRTC();
       this._watchPeer("host");
       this._watchConnectionInfo();
       this._startHeartbeat();
@@ -1429,6 +1524,17 @@ class LinkCable{
       this._logEvent("sys", "drop-not-connected", byte);
       return;
     }
+    // 優先走 WebRTC 直連（延遲低很多）；還沒建立好或中途失敗，就自動退回 Firebase 轉送，
+    // 不會因為 WebRTC 連不上就整個不能玩，只是速度回到比較慢的樣子。
+    if(this._dc && this._dc.readyState === "open"){
+      try{
+        this._dc.send(JSON.stringify({ b: byte & 0xFF, k: kind }));
+        return;
+      }catch(err){
+        this._logEvent("sys", "rtc-send-fail:" + (err && err.message || err), byte);
+        // 往下繼續走 Firebase 轉送當備援
+      }
+    }
     const outPath = this.role === "host" ? "toGuest" : "toHost";
     this.db.ref(`rooms/${this.roomCode}/${outPath}`).push({ b: byte & 0xFF, k: kind }).catch((err)=>{
       this._logEvent("sys", "send-fail:" + (err && err.message || err), byte);
@@ -1459,6 +1565,12 @@ class LinkCable{
     try{ if(this._byteRef && this._byteCb) this._byteRef.off("child_added", this._byteCb); }catch(err){}
     try{ if(this._peerOnlineRef && this._peerOnlineCb) this._peerOnlineRef.off("value", this._peerOnlineCb); }catch(err){}
     try{ if(this._peerHeartbeatRef && this._peerHeartbeatCb) this._peerHeartbeatRef.off("value", this._peerHeartbeatCb); }catch(err){}
+    (this._rtcRefs||[]).forEach(r=>{ try{ r.ref.off(r.event, r.cb); }catch(err){} });
+    this._rtcRefs = [];
+    try{ if(this._dc) this._dc.close(); }catch(err){}
+    this._dc = null;
+    try{ if(this._pc) this._pc.close(); }catch(err){}
+    this._pc = null;
     if(this.db && this.role && this.roomCode){
       try{ this.db.ref(`rooms/${this.roomCode}/${this.role}Online`).set(false); }catch(err){}
     }
@@ -3604,6 +3716,7 @@ renderLinkStatus("idle","尚未連線");
     const head = [
       `匯出時間: ${new Date().toLocaleString()}`,
       `連線狀態: ${lc.connected ? "已連線" : "未連線"}　角色: ${lc.role || "-"}　房間: ${lc.roomCode || "-"}`,
+      `傳輸通道: ${lc._dc && lc._dc.readyState==="open" ? "WebRTC 直連（低延遲）" : "Firebase 轉送（備援，較慢）"}`,
       `等待對方回覆中: ${lc._awaitingReply ? ("是（已等 " + (Date.now()-lc._awaitingReplySince) + "ms）") : "否"}`,
       `共 ${lc._log.length} 筆紀錄（依時間先後，舊→新）`,
       `------------------------------`
@@ -3636,6 +3749,7 @@ renderLinkStatus("idle","尚未連線");
     if(!lc){ panel.textContent = "linkCable 尚未初始化"; return; }
     const head = [
       `連線狀態: ${lc.connected ? "已連線" : "未連線"}　角色: ${lc.role || "-"}　房間: ${lc.roomCode || "-"}`,
+      `傳輸通道: ${lc._dc && lc._dc.readyState==="open" ? "WebRTC 直連（低延遲）" : "Firebase 轉送（備援，較慢）"}`,
       `等待對方回覆中: ${lc._awaitingReply ? ("是（已等 " + (Date.now()-lc._awaitingReplySince) + "ms）") : "否"}`,
       `------ 最近紀錄（新→舊，共 ${lc._log.length} 筆，右下角按鈕可匯出完整 TXT）------`
     ];

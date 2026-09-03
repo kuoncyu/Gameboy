@@ -1447,7 +1447,7 @@ class LinkCable{
   // 除錯記錄：只留最近 40 筆，並更新畫面上的除錯面板（若有開啟的話）
   _logEvent(dir, kind, byte){
     this._log.push({ t: Date.now(), dir, kind, byte });
-    if(this._log.length > 40) this._log.shift();
+    if(this._log.length > 600) this._log.shift(); // 匯出 TXT 用，留長一點的歷史（大約可涵蓋較長時間的嘗試）
     if(window.renderLinkDebugPanel) window.renderLinkDebugPanel();
   }
   disconnect(){
@@ -3580,6 +3580,11 @@ renderLinkStatus("idle","尚未連線");
   toggleBtn.style.cssText = "position:fixed;left:8px;bottom:8px;z-index:9999;font-size:11px;padding:4px 8px;border-radius:8px;border:1px solid #555;background:#222;color:#ddd;opacity:0.55;";
   document.body.appendChild(toggleBtn);
 
+  const exportBtn = document.createElement("button");
+  exportBtn.textContent = "匯出TXT";
+  exportBtn.style.cssText = "position:fixed;left:96px;bottom:8px;z-index:9999;font-size:11px;padding:4px 8px;border-radius:8px;border:1px solid #555;background:#222;color:#ddd;opacity:0.55;";
+  document.body.appendChild(exportBtn);
+
   const panel = document.createElement("div");
   panel.style.cssText = "position:fixed;left:8px;bottom:40px;right:8px;max-height:60vh;overflow:auto;z-index:9999;display:none;background:rgba(10,10,14,0.94);color:#9fe89f;font-family:monospace;font-size:11px;line-height:1.5;padding:8px;border-radius:10px;border:1px solid #444;white-space:pre-wrap;";
   document.body.appendChild(panel);
@@ -3591,20 +3596,54 @@ renderLinkStatus("idle","尚未連線");
     if(visible) window.renderLinkDebugPanel();
   });
 
+  const hex = (b)=> (b===null || b===undefined) ? "--" : "0x"+b.toString(16).padStart(2,"0");
+
+  function buildFullReport(){
+    const lc = window.linkCable;
+    if(!lc) return "linkCable 尚未初始化";
+    const head = [
+      `匯出時間: ${new Date().toLocaleString()}`,
+      `連線狀態: ${lc.connected ? "已連線" : "未連線"}　角色: ${lc.role || "-"}　房間: ${lc.roomCode || "-"}`,
+      `等待對方回覆中: ${lc._awaitingReply ? ("是（已等 " + (Date.now()-lc._awaitingReplySince) + "ms）") : "否"}`,
+      `共 ${lc._log.length} 筆紀錄（依時間先後，舊→新）`,
+      `------------------------------`
+    ];
+    const base = lc._log.length ? lc._log[0].t : Date.now();
+    const lines = lc._log.map(e=>{
+      if(e.dir === "sys") return `[+${e.t - base}ms] SYS ${e.kind}`;
+      const dirLabel = e.dir === "out" ? "OUT(送出)" : "IN (收到)";
+      return `[+${e.t - base}ms] ${dirLabel} kind=${e.kind}  byte=${hex(e.byte)}`;
+    });
+    return head.concat(lines).join("\n");
+  }
+
+  exportBtn.addEventListener("click", ()=>{
+    const text = buildFullReport();
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "linkcable_log_" + Date.now() + ".txt";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url), 5000);
+  });
+
   window.renderLinkDebugPanel = function(){
     if(!visible) return;
     const lc = window.linkCable;
     if(!lc){ panel.textContent = "linkCable 尚未初始化"; return; }
-    const hex = (b)=> (b===null || b===undefined) ? "--" : "0x"+b.toString(16).padStart(2,"0");
     const head = [
       `連線狀態: ${lc.connected ? "已連線" : "未連線"}　角色: ${lc.role || "-"}　房間: ${lc.roomCode || "-"}`,
       `等待對方回覆中: ${lc._awaitingReply ? ("是（已等 " + (Date.now()-lc._awaitingReplySince) + "ms）") : "否"}`,
-      `------ 最近紀錄（新→舊）------`
+      `------ 最近紀錄（新→舊，共 ${lc._log.length} 筆，右下角按鈕可匯出完整 TXT）------`
     ];
-    const lines = lc._log.slice().reverse().map(e=>{
+    const base = lc._log.length ? lc._log[0].t : Date.now();
+    const lines = lc._log.slice().reverse().slice(0, 60).map(e=>{
       const dirLabel = e.dir === "out" ? "→送出" : (e.dir === "in" ? "←收到" : "⚠ 事件");
-      if(e.dir === "sys") return `[+${e.t - (lc._log[0]?lc._log[0].t:e.t)}ms] ⚠ ${e.kind}`;
-      return `[+${e.t - (lc._log[0]?lc._log[0].t:e.t)}ms] ${dirLabel} kind=${e.kind}  byte=${hex(e.byte)}`;
+      if(e.dir === "sys") return `[+${e.t - base}ms] ⚠ ${e.kind}`;
+      return `[+${e.t - base}ms] ${dirLabel} kind=${e.kind}  byte=${hex(e.byte)}`;
     });
     panel.textContent = head.concat(lines).join("\n");
   };

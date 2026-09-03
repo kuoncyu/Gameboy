@@ -1542,18 +1542,25 @@ class LinkCable{
   }
   onSerialWrite(bus, val){
     if(!this.connected || !this.role || !this.roomCode) return;
-    if(val & 0x80){
-      // 標記為 "req"，對方收到後會自動回送目前的 SB，模擬雙向同時交換，讓本機的傳輸也能完成。
+    if(!(val & 0x80)) return;
+    if(val & 0x01){
+      // bit0=1：內部時脈，本機是這次傳輸真正的「主控端」，主動發起、送出目前 SB 的資料。
       this._sendByte(bus.io[0x01], "req");
       // 開始暫停模擬時間，直到對方的 resp 回來為止（見 isBlocking()）
       this._awaitingReply = true;
       this._awaitingReplySince = Date.now();
+    } else {
+      // bit0=0：外部時脈，本機只是「被動端」，武裝好等對方的時脈把資料送過來，
+      // 不該主動送出（否則會把本機當下可能還沒準備好的 SB 舊資料誤傳給對方，
+      // 蓋掉對方真正在等的那筆主控端資料）。等真的收到對方的 req，_deliverByte
+      // 會自動用當下 SB 內容回送 resp，被動端不需要在這裡自己送。
+      this._logEvent("sys","armed-as-slave(bit0=0)",null);
     }
   }
   // 除錯記錄：只留最近 40 筆，並更新畫面上的除錯面板（若有開啟的話）
   _logEvent(dir, kind, byte){
     this._log.push({ t: Date.now(), dir, kind, byte });
-    if(this._log.length > 600) this._log.shift(); // 匯出 TXT 用，留長一點的歷史（大約可涵蓋較長時間的嘗試）
+    if(this._log.length > 8000) this._log.shift(); // WebRTC 直連後交換速度快很多，留更長的緩衝區才不會把關鍵的傳輸過程洗掉
     if(window.renderLinkDebugPanel) window.renderLinkDebugPanel();
   }
   disconnect(){

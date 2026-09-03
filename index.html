@@ -1160,8 +1160,8 @@ class LinkCable{
     this.roomCode = null;          // 目前所在的房間代碼
     this.connected = false;        // 雙方是否都在線且心跳新鮮
     this.onStatusChange = null;    // (kind, message) => void
-    this._pendingByte = null;      // bus 尚未就緒前，暫存最後一筆待寫入的資料
-    this._pendingKind = null;      // 上述暫存資料的種類（"req" / "resp"）
+    this._incomingQueue = [];      // 收到但尚未套用進遊戲的資料佇列（避免被下一筆覆蓋掉）
+    this._deliverBusy = false;     // 上一筆收到的資料是否還在等本機遊戲處理（尚未重新寫入 SC）
     this._heartbeatTimer = null;   // 送出自己心跳的計時器
     this._monitorTimer = null;     // 檢查對方心跳是否過期的計時器
     this._peerHeartbeatAt = 0;     // 本機最後一次收到對方心跳的時間
@@ -1374,15 +1374,23 @@ class LinkCable{
     }
   }
   _receiveByte(byte, kind){
-    // 同步直連＋請求/回覆：只要對方送來資料就立刻寫入 SB 並觸發序列傳輸完成中斷，
-    // 不要求本機事先 arm。若這筆是對方「主動發起」的傳輸（kind !== "resp"），
-    // 依照真實硬體「同一次傳輸雙向同時交換」的行為，立刻把本機目前 SB 的內容
-    // 回送給對方，讓發起端也能收到「回應」而完成自己的傳輸中斷；
-    // 若這筆本身已經是回覆（kind === "resp"），就不再繼續回送，避免無限乒乓。
+    // 佇列化接收：先排隊，不直接覆蓋 SB，避免下一筆資料把本機遊戲還沒讀走的
+    // 上一筆資料蓋掉（這是造成連續大量傳輸時資料錯亂、畫面亂碼的主因）。
+    this._incomingQueue.push({ byte, kind });
+    this._pumpQueue();
+  }
+  _pumpQueue(){
+    if(this._deliverBusy) return; // 上一筆還在等本機遊戲處理，先不送下一筆
+    if(this._incomingQueue.length === 0) return;
     const bus = window.emu && window.emu.bus;
-    if(!bus){ this._pendingByte = byte; this._pendingKind = kind; return; } // 模擬器尚未載入 ROM，先暫存，待就緒後補送
-    this._completeTransfer(bus, byte);
-    if(kind !== "resp"){
+    if(!bus) return; // 模擬器尚未載入 ROM，留在佇列裡，loadRom 完成後會呼叫 _pumpQueue() 補送
+    const item = this._incomingQueue.shift();
+    this._deliverBusy = true;
+    this._completeTransfer(bus, item.byte);
+    // 依照真實硬體「同一次傳輸雙向同時交換」的行為：若這筆是對方主動發起的傳輸
+    // （kind !== "resp"），立刻回送本機目前 SB 的內容，讓發起端也能完成自己的傳輸；
+    // 若本身已經是回覆（kind === "resp"）就不再繼續回送，避免無限乒乓。
+    if(item.kind !== "resp"){
       this._sendByte(bus.io[0x01], "resp");
     }
   }
@@ -1399,9 +1407,11 @@ class LinkCable{
   onSerialWrite(bus, val){
     if(!this.connected || !this.role || !this.roomCode) return;
     if(val & 0x80){
-      // 本機遊戲主動啟動傳輸：標記為 "req"，對方收到後會自動回送目前的 SB，
-      // 模擬雙向同時交換，讓本機的傳輸也能完成。
+      // 本機遊戲重新寫入 SC，代表前一筆收到的資料已經處理完畢，可以接收下一筆了
+      this._deliverBusy = false;
+      // 標記為 "req"，對方收到後會自動回送目前的 SB，模擬雙向同時交換，讓本機的傳輸也能完成。
       this._sendByte(bus.io[0x01], "req");
+      this._pumpQueue(); // 若佇列裡還有排隊中的資料，這裡立刻補送
     }
   }
   disconnect(){
@@ -1423,8 +1433,8 @@ class LinkCable{
     this.connected = false;
     this.role = null;
     this.roomCode = null;
-    this._pendingByte = null;
-    this._pendingKind = null;
+    this._incomingQueue = [];
+    this._deliverBusy = false;
     this._peerOnline = false;
     this._peerHeartbeatAt = 0;
   }
@@ -2488,14 +2498,9 @@ class Emulator{
     const apu = new APU(bus, sampleRate);
     bus.ppu = ppu; bus.timer = timer; bus.cpu = cpu; bus.apu = apu;
     this.bus = bus; this.ppu = ppu; this.timer = timer; this.cpu = cpu; this.apu = apu;
-    // ROM 剛就緒：若連線對戰在載入完成前就收到對方送來的資料，這裡立刻補套用一次
-    // （改走 _receiveByte，確保「req」種類的暫存資料也會照樣自動回送 resp）
-    if(window.linkCable && window.linkCable._pendingByte !== null){
-      const b = window.linkCable._pendingByte;
-      const k = window.linkCable._pendingKind;
-      window.linkCable._pendingByte = null;
-      window.linkCable._pendingKind = null;
-      window.linkCable._receiveByte(b, k);
+    // ROM 剛就緒：若連線對戰在載入完成前就已經有排隊中的資料，這裡立刻補送一次
+    if(window.linkCable){
+      window.linkCable._pumpQueue();
     }
     this.running = true;
     this.paused = false;

@@ -1542,19 +1542,14 @@ class LinkCable{
   }
   onSerialWrite(bus, val){
     if(!this.connected || !this.role || !this.roomCode) return;
-    if(!(val & 0x80)) return;
-    if(val & 0x01){
-      // bit0=1：內部時脈，本機是這次傳輸真正的「主控端」，主動發起、送出目前 SB 的資料。
+    if(val & 0x80){
+      // 實測發現：拿掉 bit0 判斷、任何寫入 SC bit7 都送出，交換頻率比較密集、
+      // 連線判定比較容易成功；加上 bit0 限制後交換變得太稀疏，反而被遊戲判定連線失敗，
+      // 所以改回「任何啟動傳輸的寫入都送出」，不再依 bit0 分主動/被動。
       this._sendByte(bus.io[0x01], "req");
       // 開始暫停模擬時間，直到對方的 resp 回來為止（見 isBlocking()）
       this._awaitingReply = true;
       this._awaitingReplySince = Date.now();
-    } else {
-      // bit0=0：外部時脈，本機只是「被動端」，武裝好等對方的時脈把資料送過來，
-      // 不該主動送出（否則會把本機當下可能還沒準備好的 SB 舊資料誤傳給對方，
-      // 蓋掉對方真正在等的那筆主控端資料）。等真的收到對方的 req，_deliverByte
-      // 會自動用當下 SB 內容回送 resp，被動端不需要在這裡自己送。
-      this._logEvent("sys","armed-as-slave(bit0=0)",null);
     }
   }
   // 除錯記錄：只留最近 40 筆，並更新畫面上的除錯面板（若有開啟的話）

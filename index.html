@@ -1164,6 +1164,7 @@ class LinkCable{
     this._pendingKind = null;      // 上述暫存資料的種類（"req" / "resp"）
     this._awaitingReply = false;   // 本機是否剛送出 req、正在等對方的 resp（等待期間會暫停模擬時間）
     this._awaitingReplySince = 0;  // 開始等待的時間戳，超過安全時限就放棄暫停，避免整個模擬器卡死
+    this._log = [];                // 除錯記錄：最近幾筆送出/收到的序列埠資料，供除錯面板顯示
     this._heartbeatTimer = null;   // 送出自己心跳的計時器
     this._monitorTimer = null;     // 檢查對方心跳是否過期的計時器
     this._peerHeartbeatAt = 0;     // 本機最後一次收到對方心跳的時間
@@ -1276,9 +1277,11 @@ class LinkCable{
       if(fresh && !this.connected){
         this.connected = true;
         this._status("connected","連線成功！可以開始連線對戰／交換");
+        this._logEvent("sys", "connected(role="+this.role+")", null);
       } else if(!fresh && this.connected){
         this.connected = false;
         this._status("waiting","對方訊號中斷，正在等待自動恢復…");
+        this._logEvent("sys", "peer-lost", null);
       } else if(!fresh && !this.connected && this._peerHeartbeatAt > 0 && !this._peerOnline){
         this._status("waiting","對方已離線，可等待對方重新加入房間");
       }
@@ -1380,6 +1383,7 @@ class LinkCable{
     // 下一筆，天然就不會有「資料被下一筆蓋掉」的問題，所以收到就直接處理，
     // 不再需要佇列／忙碌旗標——那個機制反而會在雙方同時等待對方回覆時，
     // 因為彼此的 CPU 都暫停、都沒辦法重新寫入 SC 解鎖佇列，造成永久互相卡死。
+    this._logEvent("in", kind, byte);
     const bus = window.emu && window.emu.bus;
     if(!bus){ this._pendingByte = byte; this._pendingKind = kind; return; } // 模擬器尚未載入 ROM，先暫存，待就緒後補送
     this._deliverByte(bus, byte, kind);
@@ -1409,6 +1413,7 @@ class LinkCable{
     if(!this._awaitingReply) return false;
     if(Date.now() - this._awaitingReplySince > 3000){
       this._awaitingReply = false;
+      this._logEvent("sys", "timeout", null); // 等太久還是沒收到回覆，放棄暫停
       return false;
     }
     return true;
@@ -1419,9 +1424,15 @@ class LinkCable{
     bus.requestInterrupt(3); // serial transfer complete
   }
   _sendByte(byte, kind){
-    if(!this.connected || !this.role || !this.roomCode) return;
+    this._logEvent("out", kind, byte);
+    if(!this.connected || !this.role || !this.roomCode){
+      this._logEvent("sys", "drop-not-connected", byte);
+      return;
+    }
     const outPath = this.role === "host" ? "toGuest" : "toHost";
-    this.db.ref(`rooms/${this.roomCode}/${outPath}`).push({ b: byte & 0xFF, k: kind }).catch(()=>{ /* 忽略暫時性傳送失敗，遊戲端會重試 */ });
+    this.db.ref(`rooms/${this.roomCode}/${outPath}`).push({ b: byte & 0xFF, k: kind }).catch((err)=>{
+      this._logEvent("sys", "send-fail:" + (err && err.message || err), byte);
+    });
   }
   onSerialWrite(bus, val){
     if(!this.connected || !this.role || !this.roomCode) return;
@@ -1432,6 +1443,12 @@ class LinkCable{
       this._awaitingReply = true;
       this._awaitingReplySince = Date.now();
     }
+  }
+  // 除錯記錄：只留最近 40 筆，並更新畫面上的除錯面板（若有開啟的話）
+  _logEvent(dir, kind, byte){
+    this._log.push({ t: Date.now(), dir, kind, byte });
+    if(this._log.length > 40) this._log.shift();
+    if(window.renderLinkDebugPanel) window.renderLinkDebugPanel();
   }
   disconnect(){
     this._stopHeartbeat();
@@ -3555,6 +3572,43 @@ function renderLinkStatus(kind, msg){
 }
 linkCable.onStatusChange = renderLinkStatus;
 renderLinkStatus("idle","尚未連線");
+
+/* ---- 連線除錯面板：顯示最近送出/收到的序列埠資料，方便回報卡住時的實際狀況 ---- */
+(function setupLinkDebugPanel(){
+  const toggleBtn = document.createElement("button");
+  toggleBtn.textContent = "🐞連線紀錄";
+  toggleBtn.style.cssText = "position:fixed;left:8px;bottom:8px;z-index:9999;font-size:11px;padding:4px 8px;border-radius:8px;border:1px solid #555;background:#222;color:#ddd;opacity:0.55;";
+  document.body.appendChild(toggleBtn);
+
+  const panel = document.createElement("div");
+  panel.style.cssText = "position:fixed;left:8px;bottom:40px;right:8px;max-height:60vh;overflow:auto;z-index:9999;display:none;background:rgba(10,10,14,0.94);color:#9fe89f;font-family:monospace;font-size:11px;line-height:1.5;padding:8px;border-radius:10px;border:1px solid #444;white-space:pre-wrap;";
+  document.body.appendChild(panel);
+
+  let visible = false;
+  toggleBtn.addEventListener("click", ()=>{
+    visible = !visible;
+    panel.style.display = visible ? "block" : "none";
+    if(visible) window.renderLinkDebugPanel();
+  });
+
+  window.renderLinkDebugPanel = function(){
+    if(!visible) return;
+    const lc = window.linkCable;
+    if(!lc){ panel.textContent = "linkCable 尚未初始化"; return; }
+    const hex = (b)=> (b===null || b===undefined) ? "--" : "0x"+b.toString(16).padStart(2,"0");
+    const head = [
+      `連線狀態: ${lc.connected ? "已連線" : "未連線"}　角色: ${lc.role || "-"}　房間: ${lc.roomCode || "-"}`,
+      `等待對方回覆中: ${lc._awaitingReply ? ("是（已等 " + (Date.now()-lc._awaitingReplySince) + "ms）") : "否"}`,
+      `------ 最近紀錄（新→舊）------`
+    ];
+    const lines = lc._log.slice().reverse().map(e=>{
+      const dirLabel = e.dir === "out" ? "→送出" : (e.dir === "in" ? "←收到" : "⚠ 事件");
+      if(e.dir === "sys") return `[+${e.t - (lc._log[0]?lc._log[0].t:e.t)}ms] ⚠ ${e.kind}`;
+      return `[+${e.t - (lc._log[0]?lc._log[0].t:e.t)}ms] ${dirLabel} kind=${e.kind}  byte=${hex(e.byte)}`;
+    });
+    panel.textContent = head.concat(lines).join("\n");
+  };
+})();
 
 async function copyTextToClipboard(text, btn, idleLabel){
   if(!text) return;

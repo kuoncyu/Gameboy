@@ -1167,7 +1167,6 @@ class LinkCable{
     this.connected = false;        // 雙方是否都在線且心跳新鮮
     this.onStatusChange = null;    // (kind, message) => void
     this._pendingByte = null;      // bus 尚未就緒前，暫存最後一筆待寫入的資料
-    this._pendingKind = null;      // 上述暫存資料的種類（"req" / "resp"）
     this._awaitingReply = false;   // 本機是否剛送出 req、正在等對方的 resp（等待期間會暫停模擬時間）
     this._awaitingReplySince = 0;  // 開始等待的時間戳，超過安全時限就放棄暫停，避免整個模擬器卡死
     this._log = [];                // 除錯記錄：最近幾筆送出/收到的序列埠資料，供除錯面板顯示
@@ -1319,7 +1318,7 @@ class LinkCable{
     this._byteCb = (snap)=>{
       const val = snap.val();
       snap.ref.remove().catch(()=>{});
-      if(val && typeof val.b === "number") this._receiveByte(val.b & 0xFF, val.k);
+      if(val && typeof val.b === "number") this._receiveByte(val.b & 0xFF);
     };
     chRef.on("child_added", this._byteCb);
     this._byteRef = chRef;
@@ -1404,7 +1403,7 @@ class LinkCable{
     dc.onmessage = (e)=>{
       try{
         const val = JSON.parse(e.data);
-        if(val && typeof val.b === "number") this._receiveByte(val.b & 0xFF, val.k);
+        if(val && typeof val.b === "number") this._receiveByte(val.b & 0xFF);
       }catch(err){ /* 忽略解析失敗的訊息 */ }
     };
   }
@@ -1473,34 +1472,23 @@ class LinkCable{
       return false;
     }
   }
-  _receiveByte(byte, kind){
-    // 現在發送端在等回覆期間會暫停模擬時間（見 isBlocking），不會連續搶著送出
-    // 下一筆，天然就不會有「資料被下一筆蓋掉」的問題，所以收到就直接處理，
-    // 不再需要佇列／忙碌旗標——那個機制反而會在雙方同時等待對方回覆時，
-    // 因為彼此的 CPU 都暫停、都沒辦法重新寫入 SC 解鎖佇列，造成永久互相卡死。
-    this._logEvent("in", kind, byte);
+  _receiveByte(byte){
+    // 收到就直接套用，不再自動產生回覆訊息——實測發現自動回覆會污染 SB 暫存器
+    // （完成自己那筆的同時，把原本準備要送給對方的資料蓋掉），導致資料錯亂。
+    // 這個 ROM 的協定本身兩邊就會各自主動送出真正的資料，不需要我們額外幫忙回覆。
+    this._logEvent("in", byte);
     const bus = window.emu && window.emu.bus;
-    if(!bus){ this._pendingByte = byte; this._pendingKind = kind; return; } // 模擬器尚未載入 ROM，先暫存，待就緒後補送
-    this._deliverByte(bus, byte, kind);
+    if(!bus){ this._pendingByte = byte; return; } // 模擬器尚未載入 ROM，先暫存，待就緒後補送
+    this._deliverByte(bus, byte);
   }
-  _deliverByte(bus, byte, kind){
-    // 一定要在覆寫 SB 之前，先記錄本機「原本準備送出」的資料，
-    // 否則下面 _completeTransfer 會把 bus.io[0x01] 蓋成剛收到的資料，
-    // 回送出去的 resp 就變成把對方的資料原封不動彈回去，而不是本機真正的回應。
-    const myByte = bus.io[0x01];
+  _deliverByte(bus, byte){
     this._completeTransfer(bus, byte);
-    // 依照真實硬體「同一次傳輸雙向同時交換」的行為：若這筆是對方主動發起的傳輸
-    // （kind !== "resp"），立刻回送本機（覆寫前）的 SB 內容，讓發起端也能完成自己的傳輸；
-    // 若本身已經是回覆（kind === "resp"）就不再繼續回送，避免無限乒乓。
-    if(kind !== "resp"){
-      this._sendByte(myByte, "resp");
-    } else {
-      // 收到的是對方回送的 resp：代表本機先前那筆 req 已經有結果了，
-      // 可以讓暫停的模擬時間繼續往前跑。
-      this._awaitingReply = false;
-    }
+    // 收到任何一筆資料都代表「有新事件發生」，讓暫停中的模擬時間可以繼續跑。
+    // 通道是可靠、依序送達的（WebRTC ordered data channel／Firebase push 依序觸發），
+    // 依序處理即可，不需要嚴格配對「這筆是不是剛好回應我剛送出的那筆」。
+    this._awaitingReply = false;
   }
-  // 是否應該讓模擬器暫停「不跑」：本機剛送出 req、正在等對方的 resp 期間，
+  // 是否應該讓模擬器暫停「不跑」：本機剛送出資料、正在等對方回應期間，
   // 讓 CPU/PPU/Timer 停止前進，避免真實世界的網路延遲被算進遊戲內部的逾時計時器，
   // 造成遊戲誤判「太久沒收到連線資料」而顯示 Too much time has elapsed。
   // 有安全時限，超過就放棄暫停（避免對方真的斷線時整個模擬器卡死）。
@@ -1518,43 +1506,40 @@ class LinkCable{
     bus.io[0x02] = bus.io[0x02] & 0x7F;
     bus.requestInterrupt(3); // serial transfer complete
   }
-  _sendByte(byte, kind){
-    this._logEvent("out", kind, byte);
+  _sendByte(byte){
+    this._logEvent("out", byte);
     if(!this.connected || !this.role || !this.roomCode){
-      this._logEvent("sys", "drop-not-connected", byte);
+      this._logEvent("sys", "drop-not-connected byte=0x"+(byte&0xFF).toString(16));
       return;
     }
     // 優先走 WebRTC 直連（延遲低很多）；還沒建立好或中途失敗，就自動退回 Firebase 轉送，
     // 不會因為 WebRTC 連不上就整個不能玩，只是速度回到比較慢的樣子。
     if(this._dc && this._dc.readyState === "open"){
       try{
-        this._dc.send(JSON.stringify({ b: byte & 0xFF, k: kind }));
+        this._dc.send(JSON.stringify({ b: byte & 0xFF }));
         return;
       }catch(err){
-        this._logEvent("sys", "rtc-send-fail:" + (err && err.message || err), byte);
+        this._logEvent("sys", "rtc-send-fail(byte=0x"+(byte&0xFF).toString(16)+"):" + (err && err.message || err));
         // 往下繼續走 Firebase 轉送當備援
       }
     }
     const outPath = this.role === "host" ? "toGuest" : "toHost";
-    this.db.ref(`rooms/${this.roomCode}/${outPath}`).push({ b: byte & 0xFF, k: kind }).catch((err)=>{
-      this._logEvent("sys", "send-fail:" + (err && err.message || err), byte);
+    this.db.ref(`rooms/${this.roomCode}/${outPath}`).push({ b: byte & 0xFF }).catch((err)=>{
+      this._logEvent("sys", "send-fail(byte=0x"+(byte&0xFF).toString(16)+"):" + (err && err.message || err));
     });
   }
   onSerialWrite(bus, val){
     if(!this.connected || !this.role || !this.roomCode) return;
     if(val & 0x80){
-      // 實測發現：拿掉 bit0 判斷、任何寫入 SC bit7 都送出，交換頻率比較密集、
-      // 連線判定比較容易成功；加上 bit0 限制後交換變得太稀疏，反而被遊戲判定連線失敗，
-      // 所以改回「任何啟動傳輸的寫入都送出」，不再依 bit0 分主動/被動。
-      this._sendByte(bus.io[0x01], "req");
-      // 開始暫停模擬時間，直到對方的 resp 回來為止（見 isBlocking()）
+      this._sendByte(bus.io[0x01]);
+      // 開始暫停模擬時間，直到對方送來下一筆資料為止（見 isBlocking()）
       this._awaitingReply = true;
       this._awaitingReplySince = Date.now();
     }
   }
-  // 除錯記錄：只留最近 40 筆，並更新畫面上的除錯面板（若有開啟的話）
-  _logEvent(dir, kind, byte){
-    this._log.push({ t: Date.now(), dir, kind, byte });
+  // 除錯記錄：留長一點的歷史方便匯出診斷，並更新畫面上的除錯面板（若有開啟的話）
+  _logEvent(dir, byte){
+    this._log.push({ t: Date.now(), dir, byte });
     if(this._log.length > 8000) this._log.shift(); // WebRTC 直連後交換速度快很多，留更長的緩衝區才不會把關鍵的傳輸過程洗掉
     if(window.renderLinkDebugPanel) window.renderLinkDebugPanel();
   }
@@ -1584,7 +1569,6 @@ class LinkCable{
     this.role = null;
     this.roomCode = null;
     this._pendingByte = null;
-    this._pendingKind = null;
     this._awaitingReply = false;
     this._awaitingReplySince = 0;
     this._peerOnline = false;
@@ -2653,10 +2637,8 @@ class Emulator{
     // ROM 剛就緒：若連線對戰在載入完成前就收到對方送來的資料，這裡立刻補套用一次
     if(window.linkCable && window.linkCable._pendingByte !== null){
       const b = window.linkCable._pendingByte;
-      const k = window.linkCable._pendingKind;
       window.linkCable._pendingByte = null;
-      window.linkCable._pendingKind = null;
-      window.linkCable._deliverByte(bus, b, k);
+      window.linkCable._deliverByte(bus, b);
     }
     this.running = true;
     this.paused = false;
@@ -3732,9 +3714,9 @@ renderLinkStatus("idle","尚未連線");
     ];
     const base = lc._log.length ? lc._log[0].t : Date.now();
     const lines = lc._log.map(e=>{
-      if(e.dir === "sys") return `[+${e.t - base}ms] SYS ${e.kind}`;
+      if(e.dir === "sys") return `[+${e.t - base}ms] SYS ${e.byte}`;
       const dirLabel = e.dir === "out" ? "OUT(送出)" : "IN (收到)";
-      return `[+${e.t - base}ms] ${dirLabel} kind=${e.kind}  byte=${hex(e.byte)}`;
+      return `[+${e.t - base}ms] ${dirLabel} byte=${hex(e.byte)}`;
     });
     return head.concat(lines).join("\n");
   }
@@ -3765,8 +3747,8 @@ renderLinkStatus("idle","尚未連線");
     const base = lc._log.length ? lc._log[0].t : Date.now();
     const lines = lc._log.slice().reverse().slice(0, 60).map(e=>{
       const dirLabel = e.dir === "out" ? "→送出" : (e.dir === "in" ? "←收到" : "⚠ 事件");
-      if(e.dir === "sys") return `[+${e.t - base}ms] ⚠ ${e.kind}`;
-      return `[+${e.t - base}ms] ${dirLabel} kind=${e.kind}  byte=${hex(e.byte)}`;
+      if(e.dir === "sys") return `[+${e.t - base}ms] ⚠ ${e.byte}`;
+      return `[+${e.t - base}ms] ${dirLabel} byte=${hex(e.byte)}`;
     });
     panel.textContent = head.concat(lines).join("\n");
   };
